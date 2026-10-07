@@ -1,3 +1,18 @@
+"""DDIM 反演 + 部分去噪，用于论文 5.5 节的「更深的重建」。
+
+思路：
+1. invert() 把图像沿 DDIM 反演方向推到带噪的隐状态 x_T'（相当于「加密」成噪声），
+   反演步数由 invert_steps 控制，可以只反演一部分。
+2. denoise() 从某个中间时刻开始正向去噪回图像（默认从 x_T 走到 x_0，
+   也可用 denoise_from/denoise_steps 只走一段）。
+
+于是 compute_reconstruction 就是「反演 k 步 → 再往回 k 步」，往返越深、
+重建图越模糊，检验的是「AE 重建质量越差，AEROBLADE 是否同样有效」。
+
+文件里保留了 diffusers 官方 pix2pix-zero 管线的大量注释级代码（包括被
+注释掉的旧实现），我们只加中文注释，不动原逻辑。
+"""
+
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -20,10 +35,19 @@ from diffusers.utils.logging import disable_progress_bar
 from torchvision.transforms.functional import pil_to_tensor
 from transformers import BlipForConditionalGeneration, BlipProcessor
 
+from aeroblade.misc import resolve_model_source
+
+# diffusers 内部会打很多加载日志，实验脚本要输出自己的进度条，这里全局关掉。
 disable_progress_bar()
 
 
 class BLIPCaptioner:
+    """用 BLIP 给图像生成描述，充当后续反演/去噪所需的提示词。
+
+    检测流程里我们并不知道原图的真实提示词；用 BLIP 现编一个「差不多的」
+    就够——这也说明 AEROBLADE 并不依赖提示词还原得准不准。
+    """
+
     def __init__(self, captioner_ckpt="Salesforce/blip-image-captioning-large"):
         self.captioner_ckpt = captioner_ckpt
         self.caption_processor = BlipProcessor.from_pretrained(self.captioner_ckpt)
@@ -31,13 +55,17 @@ class BLIPCaptioner:
             self.captioner_ckpt,
             # low_cpu_mem_usage=True
         )
+        # 字幕模型固定跑在 cuda 上；与扩散模型共享显存时靠下面的
+        # 「用完就搬回去」来错峰。
         self._execution_device = torch.device("cuda")
 
     @torch.no_grad()
     def generate_caption(self, image):
         """Generates caption for a given image."""
+        # text="" 表示只做图像描述（非条件生成），BLIP 会从 <bos> 开始生成。
         text = ""
 
+        # 记录当前所在设备，推理结束后归还，避免长期占用显存。
         prev_device = self.caption_generator.device
 
         device = self._execution_device
@@ -50,6 +78,7 @@ class BLIPCaptioner:
         # offload caption generator
         self.caption_generator.to(prev_device)
 
+        # batch_decode + 取 [0]：每次只描述一张图。
         caption = self.caption_processor.batch_decode(
             outputs, skip_special_tokens=True
         )[0]
@@ -57,6 +86,11 @@ class BLIPCaptioner:
 
 
 class CLIPInterrogator:
+    """用 CLIP Interrogator 生成提示词（比 BLIP 更长、更像 SD 风格提示词）。
+
+    这是 create_pipeline 的默认字幕器；BLIP 是 use_blip_only=True 时的备选。
+    """
+
     def __init__(self, clip_model_name="ViT-L-14/openai"):
         self.interrogator = Interrogator(
             Config(clip_model_name=clip_model_name, quiet=True)
@@ -64,6 +98,7 @@ class CLIPInterrogator:
 
     @torch.no_grad()
     def generate_caption(self, image):
+        # 直接转发，接口与 BLIPCaptioner 保持一致（鸭子类型）。
         return self.interrogator.interrogate(image)
 
 
@@ -80,11 +115,21 @@ class InversionPipelineOutput(BaseOutput):
             num_channels)`. PIL images or numpy array present the denoised images of the diffusion pipeline.
     """
 
+    # 同时返回隐状态和解码图：距离既可以在像素域算，也可以在隐空间算
+    #（见 compute_stepwise_reconstruction_distance 的 use_latent）。
     latents: torch.FloatTensor
     images: Union[List[PIL.Image.Image], np.ndarray]
 
 
 class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline):
+    """在 pix2pix-zero 管线上加了「部分反演 / 部分去噪」的能力。
+
+    继承 pix2pix-zero 是为了复用它的 auto_corr_loss / kl_divergence /
+    get_epsilon（反演时的正则化项：把预测出的噪声约束成近似标准正态，
+    否则 DDIM 反演的噪声会越来越不像高斯，往返重建就不稳）。
+    """
+
+    # silent 控制是否打印选中的时间步；批量跑实验时设为 True 免得刷屏。
     silent = True
 
     @torch.no_grad()
@@ -178,10 +223,12 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
                 "not-safe-for-work" (nsfw) content.
         """
         # 0. Default height and width to unet
+        # 不指定尺寸时按 UNet 的默认采样尺寸 × VAE 下采样倍率（512）。
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
 
         # 1. Check inputs. Raise error if not correct
+        # 注意：这是上游代码遗留的调试 print，保持原样不动。
         print(
             prompt,
             height,
@@ -203,6 +250,7 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         )
 
         # 2. Define call parameters
+        # batch 大小从 prompt 推断；只给 embeddings 时看 embeddings 的第 0 维。
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
@@ -214,6 +262,7 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
+        # >1 才启用 CFG（此时 UNet 前向要跑「有条件+无条件」两份）。
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 3. Encode input prompt
@@ -222,6 +271,8 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
             if cross_attention_kwargs is not None
             else None
         )
+        # 注意用的是 _encode_prompt（pix2pix 版本，支持 token 级加权），
+        # 与下面 invert() 里的 encode_prompt 不同。
         prompt_embeds = self._encode_prompt(
             prompt,
             device,
@@ -234,12 +285,15 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         )
 
         # 4. Prepare timesteps
+        # 去噪用正向调度器（DDIMScheduler），时间步从大到小。
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
         # 5. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
         # print(f"---- num_channels_latents: {num_channels_latents}")
+        # 可以传入已有的带噪 latents（这就是「部分去噪」的入口：从反演
+        # 得到的中间状态接着往下采样）。
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             num_channels_latents,
@@ -258,11 +312,15 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
         # print(f"Normal timesteps: {timesteps}")
+        # denoise_from：从第几个时间步开始（0 = 从最噪的 x_T 开始）。
+        # denoise_steps：一共走多少步；None 表示一路走到 x_0。
         denoise_steps = (
             denoise_steps
             if denoise_steps is not None
             else num_inference_steps - denoise_from
         )
+        # 注意是切片，不是重新 set_timesteps：这样「部分去噪」与完整
+        # 去噪在相同步数下的数值行为完全一致。
         timesteps = timesteps[denoise_from : denoise_from + denoise_steps]
         if not self.silent:
             print(f"Selected timesteps: {timesteps}")
@@ -270,9 +328,11 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         with self.progress_bar(total=len(timesteps)) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
+                # CFG 要求 batch 里前半是无条件、后半是有条件，所以复制一份。
                 latent_model_input = (
                     torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 )
+                # 不同调度器对输入 latent 的缩放方式不同，必须交给调度器处理。
                 latent_model_input = self.scheduler.scale_model_input(
                     latent_model_input, t
                 )
@@ -287,6 +347,7 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
                 )[0]
 
                 # perform guidance
+                # 标准 CFG：无条件预测 + w × (有条件 - 无条件)。
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (
@@ -295,11 +356,13 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
 
                 if do_classifier_free_guidance and guidance_rescale > 0.0:
                     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
+                    # 默认 0.0，即不启用（zero terminal SNR 场景才需要）。
                     noise_pred = rescale_noise_cfg(
                         noise_pred, noise_pred_text, guidance_rescale=guidance_rescale
                     )
 
                 # compute the previous noisy sample x_t -> x_t-1
+                # 去噪用正向 scheduler.step。
                 latents = self.scheduler.step(
                     noise_pred, t, latents, **extra_step_kwargs, return_dict=False
                 )[0]
@@ -313,6 +376,7 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
                         callback(i, t, latents)
 
         # compute image
+        # 隐空间 → 像素：先除以缩放因子还原 VAE 的输入尺度，再解码。
         image = self.vae.decode(
             latents / self.vae.config.scaling_factor, return_dict=False
         )[0]
@@ -320,6 +384,7 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         # image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=[True] * numimg)
         image = self.image_processor.postprocess(image, output_type=output_type)
 
+        # 返回约定与 diffusers 一致；nsfw 检测被跳过，统一填 False。
         if return_latent:
             if not return_dict:
                 ret = (latents, image, [False] * numimg)
@@ -334,6 +399,7 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
                 )
 
         # Offload last model to CPU
+        # 显存不够时是「逐层上卡」模式，收尾要手动把最后一块搬回 CPU。
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
             self.final_offload_hook.offload()
         return ret
@@ -361,6 +427,8 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         #     return (image, has_nsfw_concept)
 
         # return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+        # 上面这段是被 return 提前截断的死代码，来自上游 diffusers 的原始实现，
+        # 保留以便与官方版本对照。
 
     @torch.no_grad()
     def invert(
@@ -468,18 +536,23 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
+        # 反演默认 guidance_scale=1，即不做 CFG（反演要的是「忠实还原」，
+        # 而不是「按提示词生成」）。
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 3. Preprocess image
+        # 统一到 [-1,1] 张量。
         image = self.image_processor.preprocess(image)
 
         # 4. Prepare latent variables
+        # 编码到隐空间：反演的起点 x_0。
         latents = self.prepare_image_latents(
             image, batch_size, self.vae.dtype, device, generator
         )
 
         # 5. Encode input prompt
         num_images_per_prompt = 1
+        # 这里用的是标准 encode_prompt，取 [0] 拿 prompt_embeds。
         prompt_embeds = self.encode_prompt(
             prompt,
             device,
@@ -489,6 +562,8 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         )[0]
 
         # 4. Prepare timesteps
+        # 关键：用 inverse_scheduler（DDIMInverseScheduler），时间步从小到大，
+        # 是 DDIM 的逆过程。
         self.inverse_scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.inverse_scheduler.timesteps
 
@@ -496,6 +571,11 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         # use them for guiding the subsequent image generation.
 
         # 7. Denoising loop where we obtain the cross-attention maps.
+        # invert_steps 支持一次反演、多个深度取点：
+        #   单个 int  → 只返回该深度的结果（return_single=True）
+        #   元组      → 把沿途这些深度的隐状态都存下来一起返回
+        # 这样 compute_stepwise_reconstruction_distance 只需跑一次反演
+        # 就能比较 k 步与 k+1 步两个中间状态。
         return_single = False
         if invert_steps is None:
             invert_steps = (num_inference_steps,)
@@ -507,13 +587,17 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         )
         invert_from = 0
         # print(f"Normal timesteps: {timesteps}")
+        # 只反演到所需的最深一步（max(invert_steps)），多余的不算。
         timesteps = timesteps[invert_from : invert_from + max(invert_steps)]
         if not self.silent:
             print(f"Selected timesteps: {timesteps}")
+        # 索引 i 对应第 i 步之后的状态，所以取 timesteps[i-1] 作为「第 i 步」
+        # 的时间步标签，用它当字典键。
         return_timesteps = [timesteps[i - 1] for i in invert_steps]
         if not self.silent:
             print(f"Return timesteps: {return_timesteps}")
 
+        # 记录沿途需要返回的隐状态，键是时间步数值。
         ret_latents = {}
 
         with self.progress_bar(total=len(timesteps)) as progress_bar:
@@ -527,6 +611,7 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
                 )
 
                 # predict the noise residual
+                # 注意这里没写 return_dict=False，所以取 .sample。
                 noise_pred = self.unet(
                     latent_model_input,
                     t,
@@ -542,15 +627,24 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
                     )
 
                 # regularization of the noise prediction
+                # 反演的核心技巧：DDIM 反演出的噪声会偏离标准正态，导致
+                # 「反演再重建」不闭合。这里对噪声预测做几步梯度下降，
+                # 把它拉回「接近 IID 标准正态」：
+                #   - auto_corr_loss：抑制空间自相关（相邻像素不该相关）
+                #   - kl_divergence：把分布拉向 N(0, I)
+                # lambda_* 是学习率式的权重系数（20 比较大，但要配合
+                # num_reg_steps/num_auto_corr_rolls 一起看）。
                 with torch.enable_grad():
                     for _ in range(num_reg_steps):
                         if lambda_auto_corr > 0:
+                            # 多次随机 roll 求平均梯度，降低单次 roll 的方差。
                             for _ in range(num_auto_corr_rolls):
                                 var = torch.autograd.Variable(
                                     noise_pred.detach().clone(), requires_grad=True
                                 )
 
                                 # Derive epsilon from model output before regularizing to IID standard normal
+                                # 正则化对象是「由模型输出推出的 ε」，而不是模型输出本身。
                                 var_epsilon = self.get_epsilon(
                                     var, latent_model_input.detach(), t
                                 )
@@ -560,6 +654,8 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
                                 )
                                 l_ac.backward()
 
+                                # 梯度按 roll 次数平均，等价于对多次 roll 的
+                                # 梯度取均值。
                                 grad = var.grad.detach() / num_auto_corr_rolls
                                 noise_pred = noise_pred - lambda_auto_corr * grad
 
@@ -579,13 +675,16 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
                             grad = var.grad.detach()
                             noise_pred = noise_pred - lambda_kl * grad
 
+                        # 每步正则化后切断计算图，避免梯度累积到下一轮。
                         noise_pred = noise_pred.detach()
 
                 # compute the previous noisy sample x_t -> x_t-1
+                # 反演用 inverse_scheduler，方向与去噪相反。
                 latents = self.inverse_scheduler.step(
                     noise_pred, t, latents
                 ).prev_sample
 
+                # 需要的话把当前中间状态存下来（深拷贝在下面做）。
                 if t in return_timesteps:
                     ret_latents[t.cpu().item()] = latents
 
@@ -601,10 +700,13 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         rets = []
         # print(ret_latents.keys())
         for select_t in return_timesteps:
+            # 时间步是张量，必须先 .cpu().item() 再当字典键（张量不可哈希）。
             latents = ret_latents[select_t.cpu().item()]
+            # detach + clone：把中间状态从计算图里摘出来。
             inverted_latents = latents.detach().clone()
 
             # 8. Post-processing
+            # 顺便解码出像素图，方便肉眼看反演到第 k 步长什么样。
             image = self.vae.decode(
                 latents / self.vae.config.scaling_factor, return_dict=False
             )[0]
@@ -621,6 +723,7 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
             self.final_offload_hook.offload()
 
+        # 只请求了一个深度就返回单个对象，避免调用方到处写 [0]。
         if len(rets) == 1 and return_single:
             return rets[0]
         else:
@@ -633,14 +736,19 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         prompt: str = None,
         num_inference_steps=50,
     ):
+        """反演 k 步再退回 k 步，得到 x0 的扩散重建结果。"""
+        # 不传提示词就现编一个（BLIP/CLIP Interrogator）。
         if prompt is None:
             prompt = self.generate_caption(x0)
+        # 第一步：x0 → 隐空间 → 反演 reconstruction_steps 步。
         x_inv = self.invert(
             prompt,
             x0,
             invert_steps=reconstruction_steps,
             num_inference_steps=num_inference_steps,
         ).latents
+        # 第二步：从对应的时间步开始往回走同样的步数。
+        # denoise_from = 总步数 - k，正好是反演到第 k 步所处的时刻。
         x_recon = self.denoise(
             prompt,
             latents=x_inv,
@@ -657,6 +765,7 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         num_inference_steps=50,
         distance="l2",
     ):
+        """原图与「k 步往返重建结果」的 L2 距离。"""
         xrecon = self.compute_reconstruction(
             x0,
             reconstruction_steps,
@@ -664,6 +773,9 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
             num_inference_steps=num_inference_steps,
         )
         if distance == "l2":
+            # 先归一到 [-1,1]，再拉平成一维向量，最后用 cdist 算欧氏距离。
+            # （这里的 [None, None] 把 (N,) 变成 (1,1,N)，是为了复用 cdist
+            # 的批量接口拿一个标量结果。）
             x0_pt = pil_to_tensor(x0).float() / 127.5 - 1
             xrecon_pt = pil_to_tensor(xrecon).float() / 127.5 - 1
             x0_pt = x0_pt.flatten()[None, None]
@@ -686,9 +798,14 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         """reconstruction_steps specifies how many inference steps to go back to obtain x-tilde from paper,
         extra_steps specifies how many inference steps to go back and forth to obtain a reconstruction of x-tilde
         note that inference steps skip over multiple original DDPM training steps, rather than the original DDPM steps used in training.
+
+        论文里的「逐步重建误差」：把图像反演到第 k 步得到 x̃（x-tilde），
+        再只往前退 1 步得到 x̃ 的重建，两者之差就是第 k 步的局部往返误差。
+        这比「走完全程再比」更能看出误差是在哪一段产生的。
         """
         if prompt is None:
             prompt = self.generate_caption(x0)
+        # 一次反演取两个中间状态：第 k 步（x̃）和第 k+extra 步。
         ret = self.invert(
             prompt,
             x0,
@@ -696,6 +813,9 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
             num_inference_steps=num_inference_steps,
         )
         x_inv, x_inv_extra = ret
+        # 从第 k+extra 步只往回退 extra_steps 步，得到 x̃ 的重建。
+        # 注意必须传 denoise_steps 限制步数，否则会一路退到 x_0
+        #（那就变成整幅图的重建，而不是「逐步」的了）。
         x_extra_recon = self.denoise(
             prompt,
             latents=x_inv_extra.latents,
@@ -706,6 +826,8 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         )
         # print(x_inv.latents.shape, x_extra_recon.shape, x_inv.latents.min(), x_inv.latents.max(), x_inv.latents.mean())
         if distance == "l2":
+            # use_latent=True 在隐空间比较（更敏感、无需解码）；
+            # False 则解码到像素域再比（更贴近人眼看到的结果）。
             if use_latent:
                 x_inv = x_inv.latents[0]
                 x_extra_recon = x_extra_recon.latents[0]
@@ -723,10 +845,13 @@ class StableDiffusionPipelinePartialInversion(StableDiffusionPix2PixZeroPipeline
         return dist
 
     def generate_caption(self, image):
+        # 转发到创建管线时挂上的字幕器（BLIP 或 CLIP Interrogator）。
         return self.captioner.generate_caption(image)
 
 
 def compute_diff(img1, img2):
+    """两张图求差并偏移到中灰，方便直接当图看（论文定性分析用）。"""
+    # offset=127 把差值映射到 [0,255] 中心，scale=1 不放大对比度。
     x_diff = PIL.ImageChops.subtract(img1, img2, offset=127, scale=1)
     return x_diff
 
@@ -737,18 +862,26 @@ def create_pipeline(
     clip_interrogate_ckpt="ViT-L-14/openai",
     use_blip_only=False,
 ):
+    """组装一条「反演 + 部分去噪」的管线（5.5 节深入重建实验用）。"""
+    # 默认用 CLIP Interrogator 生成更丰富的提示词；use_blip_only=True
+    # 时用 BLIP（更快，也是 compute_deeper_reconstructions 走的分支）。
     if use_blip_only:
         captioner = BLIPCaptioner(captioner_ckpt=blip_ckpt)
     else:
         captioner = CLIPInterrogator(clip_model_name=clip_interrogate_ckpt)
 
-    pipeline = StableDiffusionPipelinePartialInversion.from_pretrained(sd_model_ckpt)
+    pipeline = StableDiffusionPipelinePartialInversion.from_pretrained(
+        resolve_model_source(sd_model_ckpt)
+    )
 
+    # 从同一份配置派生出一对调度器：正向（去噪）与逆向（反演）。
+    # 两者必须来自同一 config，否则噪声表不一致，往返就不会闭合。
     pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
     pipeline.inverse_scheduler = DDIMInverseScheduler.from_config(
         pipeline.scheduler.config
     )
     pipeline.enable_model_cpu_offload()
 
+    # 把字幕器挂在管线上，便于 self.generate_caption 调用。
     pipeline.captioner = captioner
     return pipeline

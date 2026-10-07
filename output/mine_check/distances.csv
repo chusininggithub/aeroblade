@@ -1,0 +1,5 @@
+dir,image_size,repo_id,transform,distance_metric,file,distance
+data\mine,512,CompVis/stable-diffusion-v1-1,clean,lpips_vgg_2,lake_man_512.png,-0.0235595703125
+data\mine,512,stabilityai/stable-diffusion-2-base,clean,lpips_vgg_2,lake_man_512.png,-0.02239990234375
+data\mine,512,kandinsky-community/kandinsky-2-1,clean,lpips_vgg_2,lake_man_512.png,-0.0211181640625
+data\mine,512,max,clean,lpips_vgg_2,lake_man_512.png,-0.0211181640625

@@ -12,3 +12,6 @@ lightning_logs
 tmp
 aeroblade_output
 aeroblade_data
+
+# JiuwenSwarm runtime file operation logs
+.agent_history/

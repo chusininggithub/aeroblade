@@ -1,0 +1,1 @@
+{"ds": "Dataset ImageFolder\n    Number of datapoints: 1\n    Paths: [WindowsPath('data/mine')]\n    Transform: Compose(\n      ToImage()\n      ToDtype(scale=True)\n)", "repo_id": "kandinsky-community/kandinsky-2-1", "output_root": "output\\mine_check\\reconstructions", "seed": "1"}

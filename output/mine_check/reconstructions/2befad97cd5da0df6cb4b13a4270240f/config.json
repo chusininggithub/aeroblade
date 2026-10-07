@@ -1,0 +1,1 @@
+{"ds": "Dataset ImageFolder\n    Number of datapoints: 1\n    Paths: [WindowsPath('data/mine')]\n    Transform: Compose(\n      ToImage()\n      ToDtype(scale=True)\n)", "repo_id": "stabilityai/stable-diffusion-2-base", "output_root": "output\\mine_check\\reconstructions", "seed": "1"}
