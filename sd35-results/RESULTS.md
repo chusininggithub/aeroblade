@@ -99,7 +99,7 @@ AEROBLADE 的框架在 16 通道 VAE 时代**依然成立**，但扩展到一个
 |---|---|
 | `figures/fig2_own_ae.png` | 加入自身 AE 前后的 AP / TPR@5%FPR（357 基线，三个配置同源） |
 | `figures/fig3_recon_error.png` | 各 AE 在 SD3.5 生成图上的重建误差分布（机制证据） |
-| `figures/fig1_model_comparison.png` | **尚未加入**——各模型在原版 AE 池下的对比。原版 pickle 基线那张是用另一位协作者的运行结果渲染的，不属于本次新增实验；正在 357 基线上用本机自己的运行重跑，完成后补入 |
+| `figures/fig1_model_comparison.png` | 各模型在原版 AE 池下的对比（**含 3/8 个模型**：SD1.1 / KD2.1 / SD3.5），其余 5 个因 GPU 被占用未能运行 |
 
 ---
 
