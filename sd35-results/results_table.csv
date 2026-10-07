@@ -1,0 +1,6 @@
+﻿表,模型,真实图基线,AE池,AP,TPR_5FPR
+表1 原版AE池,SD1.1,pickle 1000,SD1.1+SD2-base+KD2.1,0.9606,0.818
+表1 原版AE池,SD3.5-medium,pickle 1000,SD1.1+SD2-base+KD2.1,0.6296,0.136
+表2 加自身AE前后,SD1.1,恢复 357,SD1.1+SD2-base+KD2.1（含自己的AE）,0.9786,0.93
+表2 加自身AE前后,SD3.5-medium,恢复 357,SD1.1+SD2-base+KD2.1,0.7026,0.1849
+表2 加自身AE前后,SD3.5-medium,恢复 357,SD1.1+SD2-base+KD2.1+SD3.5自己的,0.9605,0.8207
